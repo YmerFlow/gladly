@@ -7,13 +7,27 @@ The main plotting container that manages WebGL rendering and SVG axes.
 ## Constructor
 
 ```javascript
-new Plot(container, { margin } = {})
+new Plot(container, { margin, marginWithoutAxis } = {})
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `container` | HTMLElement | Parent `<div>`. Must have explicit CSS dimensions. Canvas and SVG are created inside it automatically. |
 | `margin` | object | Plot margin in px: `{ top, right, bottom, left }`. Defaults to `{ top: 60, right: 60, bottom: 60, left: 60 }`. |
+| `marginWithoutAxis` | object | Margin in px for a side that draws no axis: any of `{ top, right, bottom, left }`. A side left out uses `margin`. Defaults to `{}`, so every side uses `margin`. See [Margins](#margins). |
+
+### Margins
+
+An axis draws its tick marks, tick labels and title in three bands at **fixed pixel distances** outward from the axis line (not fractions of the margin): a tick band, the tick-label band, then the title band at the outer edge. The band sizes are read from the label atlas, so they stay correct at any font size. A side drawing all three parts needs the full `margin`. A side with no axis only needs room for the end labels of the axes beside it, which reach past the corners of the plot area. `marginWithoutAxis` sets that smaller room, so a plot that draws only a bottom and a left axis does not keep a full axis margin of empty space above and to the right of its data:
+
+```javascript
+const plot = new Plot(container, {
+  margin:            { top: 48, right: 80, bottom: 48, left: 80 },
+  marginWithoutAxis: { top: 12, right: 24, bottom: 12, left: 24 },
+})
+```
+
+A side counts as drawing an axis when a layer uses that axis and the axis is not hidden with `visible: false` in `config.axes`. **Hiding a single part gives its band back too**: with `titleVisible: false` the side loses its title band, with `tickLabelsVisible: false` it loses its label band — never dropping below `marginWithoutAxis` for that side (see [Axis-part visibility](../configuration/PlotConfiguration.md#axis-part-visibility)). This is decided again at every `update()`, so moving a layer to `yaxis_right`, or hiding an axis or one of its parts, changes the margins with it. A 3D plot uses `margin` on every side.
 
 ---
 
@@ -32,6 +46,10 @@ plot.axes["velocity_ms"] // color or filter axis, keyed by quantity kind
 ```
 
 The same `Axis` instance is returned on every access, including across `plot.update()` calls. This makes it safe to pass axis references to `linkAxes()` before or after `update()`.
+
+### `plot.margin`
+
+The margin in use, in px: `{ top, right, bottom, left }`. It is `margin` from the constructor, with `marginWithoutAxis` applied to each side that drew no axis at the last `update()`. Read it to place your own elements around the plot area; writing it has no lasting effect, since the next `update()` sets it again.
 
 ---
 
@@ -54,6 +72,8 @@ Updates the plot with new configuration and/or data.
 - Both: updates and renders
 - Neither: re-renders (equivalent to `forceUpdate()`)
 
+On a 3D plot the orbit orientation (the camera's azimuth, elevation and radius) is preserved across `update()`, so changing an unrelated setting — an axis option from the menu, say — does not snap the view back to its default angle.
+
 ### `forceUpdate()`
 
 Re-renders with existing config and data.
@@ -73,7 +93,21 @@ The returned object is a shallow copy of the last config passed to `update()`, w
 - **Color axes**: `min`/`max` reflect the current color range.
 - **Filter axes**: `min`/`max` reflect the current filter bounds (either bound may be `null` for open ranges).
 
-The result can be passed back to `update({ config })` to restore the exact current view, or serialised for state-saving / cross-plot synchronisation.
+The result can be passed back to `update({ config })` to restore the exact current view, or serialised for state-saving / cross-plot synchronisation. The axis-part keys `visible`, `tickLabelsVisible`, `titleVisible` and `locked` round-trip through it as well (see [PlotConfiguration](../configuration/PlotConfiguration.md#axis-part-visibility)).
+
+### `resetAxes()`
+
+Resets the 2D spatial axes to their data range (via `axis.setDomain(null)` on each). Color and filter axes are left alone, and **locked axes are skipped**. On a 3D plot it does nothing (reset is 2D-only). A reversed axis stays reversed and a log axis stays above zero.
+
+### `isAxisLocked(slot)`
+
+Returns `true` when `slot` holds the range lock, or when another slot **of this same plot** with the same quantity kind holds it (slots that share a quantity kind are one axis to the user, so they share one lock). It does **not** follow `linkAxes` — the lock is local to one plot and never consults another.
+
+### `setAxisLocked(slot, on)`
+
+Turns the range lock on or off. Writes the `locked` key into `axes.<slot>` — setting it on the slot when turning on, clearing it on the slot and every same-quantity-kind sibling of this plot when turning off — then **re-renders without `update()`** (no layer rebuild). It touches only this plot's config, so the change round-trips through `getConfig()` with no extra work.
+
+A locked axis ignores zoom, pan and scroll gestures (on any plot, 2D or 3D), and `resetAxes()` skips it, until the lock is switched off. It does **not** block deliberate changes: a typed limit, a programmatic `setDomain()`, and a domain pushed from a linked plot all still move it. See [Range lock](../configuration/PlotConfiguration.md#range-lock).
 
 ### `lookup(x, y)`
 
@@ -115,7 +149,7 @@ handle.remove()
 
 #### Synthetic plot events
 
-Three special event types do not correspond to DOM events and have no `coords` argument. Two report rendering errors, and one reports an axis limit typed by the user.
+Several special event types do not correspond to a plain DOM event. Two report rendering errors (`"error"` / `"no-error"`); `"axislimit"` and `"axisoptions"` report axis state the user (or your own code) changed; `"contextmenu"` is a cleaned-up right-click; and `"contextmenu_open"` fires when the built-in menu opens so you can augment it. The error events have no `coords`; the others do.
 
 ---
 
@@ -172,6 +206,92 @@ A value typed on a colorbar or filterbar float fires on the plot the float belon
 ```javascript
 plot.on('axislimit', () => saveLayout(plot.getConfig()))
 ```
+
+---
+
+**`"axisoptions"`** — fired when an axis-part key is written, by the [built-in axis menu](#built-in-axis-menu), a direct `update({ config })`, or `setAxisLocked()`. Like `"axislimit"`, it is keyed by **what** changed, not by who changed it, so a consumer persists on it without knowing a menu was involved. None of these keys propagate across `linkAxes` (the lock in particular is local to one plot), so there is no cross-plot source.
+
+The reported keys fall into two groups by where they live in the config:
+
+- **Per-slot keys** (`axes.<slot>`): `visible`, `tickLabelsVisible`, `titleVisible`, `locked`, `scale` (`"log"` / `"linear"`), `colorscale`, `colorbar` and `filterbar`. For these, `e.axis` is the slot string and `e.axis2d` is absent.
+- **2D colour-pair keys** (`colorbars[]`, keyed by the ordered quantity-kind pair): `colorscale`, `colorbar` and `enabled`. A pair has no single slot, so for these `e.axis` is `null` and `e.axis2d` is the pair key `"<qkX>__<qkY>"` (the same key used by `plot.axis2d["<qkX>__<qkY>"]`).
+
+```javascript
+plot.on('axisoptions', (e) => {
+  console.log(e.type)    // "axisoptions"
+  console.log(e.axis)    // "xaxis_bottom", or null for a 2D colour pair
+  console.log(e.axis2d)  // undefined, or "velocity_ms__density" for a 2D colour pair
+  console.log(e.key)     // "visible" | "tickLabelsVisible" | "titleVisible" | "locked"
+                         //   | "scale" | "colorscale" | "colorbar" | "filterbar" | "enabled"
+  console.log(e.value)   // the new value for that key
+})
+```
+
+Together with `"axislimit"` (for domain changes), this is everything needed to persist a layout the moment the user changes it:
+
+```javascript
+plot.on('axisoptions', () => saveLayout(plot.getConfig()))
+plot.on('axislimit',   () => saveLayout(plot.getConfig()))
+```
+
+---
+
+**`"contextmenu"`** — fired on a right press+release less than 5 px apart **that gladly did not otherwise use** (a press that closed a [lasso polygon](../user-api/Selection.md) or ended a 3D rotation does not count). It fires on the **release**, so it behaves the same whether the browser raises its own menu at the press (macOS) or the release (Windows); gladly keeps suppressing the browser's own menu on the canvas. This replaces the raw DOM `contextmenu` pass-through.
+
+The callback receives a third argument, `region`, saying where the press was:
+
+```javascript
+plot.on('contextmenu', (e, coords, region) => {
+  // region === null                              → a corner or an empty margin
+  // region.type === 'plot_area'                  → inside the plot box
+  // region.type === 'axis', region.axes[0]       → that one axis strip
+})
+```
+
+The built-in menu (below) opens from this same event. The event fires whether or not the built-in menu is enabled, so with the menu gated off you can bind your own behaviour here.
+
+#### Built-in axis menu
+
+A right-click opens gladly's own menu: a **full menu** on a plot-area / corner / empty-margin click, or a **single-axis menu** (one spatial row, with **Reset axis**) on an axis-strip click. The checkboxes write the matching `axes.<slot>` keys and call `setAxisLocked()` / `resetAxes()`, so every change round-trips through `getConfig()` and emits `"axisoptions"` — the menu holds no state of its own. It works the same on 3D plots (a row per x/y/z axis).
+
+The full menu has two tables:
+
+- **Spatial axes** — a row per axis with **Axis** / **Labels** / **Title** / **Lock** checkboxes, a **Log** checkbox (the `scale` key, `'log'` ↔ `'linear'`), and **Reset view**.
+- **Colour, 2D-colour and filter axes** (only in the full menu, since they are plot-wide) — below the spatial table:
+  - a **colour axis** row has a colorscale dropdown (`axes[qk].colorscale`) and a tri-state **Bar** icon cycling none → vertical → horizontal (`axes[qk].colorbar`);
+  - a **2D-colour pair** row has a 2D colorscale dropdown, a **Bar** checkbox and an **Enabled** checkbox — written through `plot.axis2d[key].setConfig(...)` (the `colorbars` entry);
+  - a **filter axis** row has only the tri-state **Bar** icon (`axes[qk].filterbar`).
+
+Two top-level config booleans gate it, both **default `true`**:
+
+| key | gates |
+|---|---|
+| `plot_menu` | the full menu (plot-area / corner / empty-margin right-click) |
+| `axis_menu` | the single-axis menu (axis-strip right-click) |
+
+```javascript
+plot.update({ config: { ...config, plot_menu: false, axis_menu: false } })
+```
+
+When a gate is `false`, gladly opens no menu for that region but the `"contextmenu"` event still fires, so a consumer can bind their own menu (or any behaviour) via `plot.on('contextmenu', …)`.
+
+**`"contextmenu_open"`** — fired when the built-in menu actually opens, so a consumer can **augment** it rather than replace it. The callback is handed the fully-built menu element and mutates it in place — append rows or buttons, wire handlers, remove or restyle what gladly put there:
+
+```javascript
+plot.on('contextmenu_open', (e, coords, region, menuEl) => {
+  // region?.type === 'axis'  → the single-axis menu; region.axes[0] is its axis slot
+  // region plot-area / null  → the full menu
+  const btn = document.createElement('button')
+  btn.textContent = 'My action'
+  btn.addEventListener('click', () => { /* … */ })
+  menuEl.appendChild(btn)
+})
+```
+
+- The first three parameters — `e`, `coords`, `region` — are **exactly** those of `"contextmenu"` (same press). `region` identifies which menu opened and, for an axis strip, which axis.
+- `menuEl` is the menu's root `<div>` (`data-gladly-control="axis-menu"`), already attached to `document.body` and already refreshed. The event fires **after** the menu is built and its controls show their live values, and **before** it is positioned — so the menu is placed at its final size, staying inside the viewport after your changes.
+- Use the two events for different goals: `"contextmenu_open"` **augments** the built-in menu and fires only when it opens; `"contextmenu"` fires on every qualifying press (built-in menu or not), so with `plot_menu` / `axis_menu` set to `false` it is where you **build your own** menu from scratch.
+- The menu is rebuilt on every open, so the callback runs every time — it must not assume it runs once. gladly does not refresh controls you add; a listener that needs live-updating controls manages its own state. Multiple listeners are supported; an exception in one is caught, logged, and does not block the others or the menu.
 
 ---
 

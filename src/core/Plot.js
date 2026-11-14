@@ -4,6 +4,8 @@ import { TickLabelAtlas } from "../axes/TickLabelAtlas.js"
 import { mat4Identity, mat4Multiply } from "../math/mat4.js"
 import { ZoomController } from "../axes/ZoomController.js"
 import { AxisLimitEditor } from "../axes/AxisLimitEditor.js"
+import { AxisMenu } from "../floats/AxisMenu.js"
+import { Axis2d } from "../axes/Axis2d.js"
 import { getLayerType, getRegisteredLayerTypes } from "./LayerTypeRegistry.js"
 import { getAxisQuantityKind, getScaleTypeFloat } from "../axes/AxisQuantityKindRegistry.js"
 import { getRegisteredColorscales, getRegistered2DColorscales, buildColorscaleTexture, getColorscalesVersion } from "../colorscales/ColorscaleRegistry.js"
@@ -63,6 +65,16 @@ function buildPlotSchema(data, config) {
     $defs: { ...compDefs, ...transformDefs },
     type: "object",
     properties: {
+      axis_menu: {
+        type: "boolean",
+        default: true,
+        description: "When true (the default), a right-click on an axis strip opens gladly's built-in single-axis menu. When false, gladly opens no menu there and the 'contextmenu' event still fires, so a consumer can bind their own."
+      },
+      plot_menu: {
+        type: "boolean",
+        default: true,
+        description: "When true (the default), a right-click on the plot area / a corner / an empty margin opens gladly's built-in full menu. When false, gladly opens no menu there and the 'contextmenu' event still fires, so a consumer can bind their own."
+      },
       transforms: {
         type: "array",
         description: "Named data transforms applied before layers. Each item is a { name, transform: { ClassName: params } } object.",
@@ -104,12 +116,19 @@ function buildPlotSchema(data, config) {
         type: "object",
         additionalProperties: {
           type: "object",
+          // The boolean axis-part toggles are required with defaults so a schema-driven
+          // editor always renders them (an optional, absent key is otherwise hidden).
+          required: ["visible", "tickLabelsVisible", "titleVisible", "locked"],
           properties: {
             quantity_kind: { type: "string" },
             min: { type: "number" },
             max: { type: "number" },
             label: { type: "string" },
             scale: { type: "string", enum: ["linear", "log"] },
+            visible: { type: "boolean", default: true },
+            tickLabelsVisible: { type: "boolean", default: true },
+            titleVisible: { type: "boolean", default: true },
+            locked: { type: "boolean", default: false },
             rotate: { type: "boolean" },
             colorscale: {
               type: "string",
@@ -139,6 +158,16 @@ function buildPlotSchema(data, config) {
                 ...getRegisteredColorscales().keys(),
                 ...getRegistered2DColorscales().keys()
               ]
+            },
+            enabled: {
+              type: "boolean",
+              default: true,
+              description: "When false, this entry does not override its member axes' colorscales; the pair colours from each axis's own colorscale (same state as having no entry at all)."
+            },
+            colorbar: {
+              type: "boolean",
+              default: true,
+              description: "When false, the floating colorbar widget for this entry is not drawn."
             }
           }
         }
@@ -187,10 +216,13 @@ export class Plot extends GlBase {
     Plot._floatFactories.set(type, factoryDef)
   }
 
-  constructor(container, { margin } = {}) {
+  constructor(container, { margin, marginWithoutAxis } = {}) {
     super()
     this.container = container
-    this.margin = margin ?? { top: 60, right: 60, bottom: 60, left: 60 }
+    this._marginWithAxis = margin ?? { top: 60, right: 60, bottom: 60, left: 60 }
+    this._marginWithoutAxis = marginWithoutAxis ?? {}
+    // The margin in use; _layoutMargin() sets it per side once the axes are known.
+    this.margin = this._marginWithAxis
 
     // Real on-screen display canvas. The shared regl context renders into an
     // OffscreenCanvas and hands each frame to this canvas via its bitmaprenderer
@@ -213,6 +245,12 @@ export class Plot extends GlBase {
     this._errorListeners = new Set()
     this._noErrorListeners = new Set()
     this._axisLimitListeners = new Set()
+    this._axisOptionsListeners = new Set()
+    this._contextMenuListeners = new Set()
+    this._contextMenuOpenListeners = new Set()
+    // Set by LassoInteraction when a right press closed a polygon; cleared by
+    // ZoomController on the matching mouseup, so that press emits no 'contextmenu'.
+    this._rightPressConsumed = false
     this._hasError = false
     this._currentRenderHasError = false
     this._hadError = false
@@ -233,7 +271,55 @@ export class Plot extends GlBase {
     // Auto-managed Float widgets keyed by a config-derived tag string.
     this._floats = new Map()
 
+    // Stable Axis2d handles for 2D colour pairings, keyed by "<qkX>__<qkY>".
+    this._axis2dCache = new Map()
+    this._axis2dProxy = null
+
     this._setupResizeObserver()
+  }
+
+  // The live set of 2D colour pairs the layers fuse via colorAxes2d, as "<qkX>__<qkY>" keys.
+  _axis2dKeys() {
+    const keys = []
+    for (const layer of this.layers) {
+      for (const [, [sa, sb]] of Object.entries(layer.colorAxes2d ?? {})) {
+        const qkX = layer.colorAxes[sa]
+        const qkY = layer.colorAxes[sb]
+        if (qkX != null && qkY != null) keys.push(Axis2d.makeKey(qkX, qkY))
+      }
+    }
+    return [...new Set(keys)]
+  }
+
+  /**
+   * Returns a stable Axis2d handle for a 2D colour pairing, keyed by the ordered
+   * pair "<qkX>__<qkY>" (e.g. plot.axis2d.velocity_ms__density, or the equivalent
+   * bracket form plot.axis2d["velocity_ms__density"]). Created on first
+   * access; the same instance is returned across update() calls. Enumeration
+   * (Object.keys / for..in / `in`) reflects exactly the pairs the layers currently
+   * fuse via colorAxes2d — a pair with no backing layer is absent (but still
+   * accessible and inert).
+   */
+  get axis2d() {
+    if (!this._axis2dProxy) {
+      this._axis2dProxy = new Proxy(this._axis2dCache, {
+        get: (cache, key) => {
+          if (typeof key !== 'string') return undefined
+          if (!cache.has(key)) {
+            const [xAxis, yAxis] = Axis2d.splitKey(key)
+            cache.set(key, new Axis2d(this, xAxis, yAxis))
+          }
+          return cache.get(key)
+        },
+        has: (_cache, key) => typeof key === 'string' && this._axis2dKeys().includes(key),
+        ownKeys: () => this._axis2dKeys(),
+        getOwnPropertyDescriptor: (_cache, key) =>
+          typeof key === 'string' && this._axis2dKeys().includes(key)
+            ? { enumerable: true, configurable: true }
+            : undefined,
+      })
+    }
+    return this._axis2dProxy
   }
 
   async _applyUpdate({ config, data } = {}) {
@@ -301,10 +387,78 @@ export class Plot extends GlBase {
       this._rawData = previousRawData
       throw error
     }
+    // Emit 'axisoptions' for each axis-part key the new config changed — keyed by what
+    // changed, not by who changed it (the menu is just one caller of update()). The lock
+    // key is emitted here too for a config-path change; setAxisLocked() emits its own,
+    // and never calls update(), so the two paths never double-fire.
+    if (config !== undefined) {
+      this._emitAxisOptionsDiff(previousConfig?.axes ?? {}, config.axes ?? {})
+      this._emitColorbarsDiff(previousConfig?.colorbars ?? [], config.colorbars ?? [])
+    }
+  }
+
+  // Compare the axis-part keys of two `axes` blocks (default-normalised) and emit one
+  // 'axisoptions' event per changed slot/key. `scale` (log/linear), `colorscale`,
+  // `colorbar` and `filterbar` live here too, so each emits on change like the rest.
+  _emitAxisOptionsDiff(prevAxes, nextAxes) {
+    const DEFAULTS = {
+      visible: true, tickLabelsVisible: true, titleVisible: true, locked: false,
+      scale: undefined, colorscale: undefined, colorbar: 'none', filterbar: 'none',
+    }
+    for (const slot of new Set([...Object.keys(prevAxes), ...Object.keys(nextAxes)])) {
+      for (const [key, def] of Object.entries(DEFAULTS)) {
+        const ov = prevAxes[slot]?.[key] ?? def
+        const nv = nextAxes[slot]?.[key] ?? def
+        if (ov !== nv) this._emitAxisOptions({ type: 'axisoptions', axis: slot, key, value: nv })
+      }
+    }
+  }
+
+  // 2D colour pairs live in the `colorbars` array (keyed by the ordered quantity-kind
+  // pair), not in `axes`, so they get their own diff. Each changed colorscale/colorbar/
+  // enabled emits an 'axisoptions' with axis:null and an axis2d key ("<qkX>__<qkY>") so
+  // a pair can never be mistaken for a real slot.
+  _emitColorbarsDiff(prevCB, nextCB) {
+    const DEFAULTS = { colorscale: undefined, colorbar: true, enabled: true }
+    const index = (arr) => {
+      const m = new Map()
+      for (const e of arr) {
+        if (e?.xAxis != null && e?.yAxis != null) m.set(Axis2d.makeKey(e.xAxis, e.yAxis), e)
+      }
+      return m
+    }
+    const prev = index(prevCB), next = index(nextCB)
+    for (const axis2d of new Set([...prev.keys(), ...next.keys()])) {
+      for (const [key, def] of Object.entries(DEFAULTS)) {
+        const ov = prev.get(axis2d)?.[key] ?? def
+        const nv = next.get(axis2d)?.[key] ?? def
+        if (ov !== nv) this._emitAxisOptions({ type: 'axisoptions', axis: null, axis2d, key, value: nv })
+      }
+    }
   }
 
   async forceUpdate() {
     await this.update({})
+  }
+
+  // The merged per-slot config for one live-scaled spatial slot: the quantity kind's
+  // defaults, the stored override overlay, the live domain, and the bound quantity
+  // kind. The single place the stored overlay and the runtime state are reconciled;
+  // getConfig() loops it over every live slot and Axis.getConfig() returns it for one,
+  // so plot.getConfig().axes[slot] deep-equals plot.axes[slot].getConfig() by construction.
+  _axisConfig(slot) {
+    const scale = this.axisRegistry?.getScale(slot)
+    if (!scale) return { ...(this.currentConfig?.axes?.[slot] ?? {}) }
+    const qk          = this.axisRegistry.getQkForSlot(slot)
+    const qkDef       = qk ? getAxisQuantityKind(qk) : {}
+    const initialized = qk ? this.axisRegistry.getDomain(qk) != null : false
+    const [min, max]  = scale.domain()
+    return {
+      ...qkDef,
+      ...(this.currentConfig?.axes?.[slot] ?? {}),
+      ...(initialized ? { min, max } : {}),
+      ...(qk ? { quantity_kind: qk } : {}),
+    }
   }
 
   getConfig() {
@@ -312,19 +466,7 @@ export class Plot extends GlBase {
 
     if (this.axisRegistry) {
       for (const axisId of AXES) {
-        const scale = this.axisRegistry.getScale(axisId)
-        if (scale) {
-          const qk          = this.axisRegistry.getQkForSlot(axisId)
-          const qkDef       = qk ? getAxisQuantityKind(qk) : {}
-          const initialized = qk ? this.axisRegistry.getDomain(qk) != null : false
-          const [min, max]  = scale.domain()
-          axes[axisId] = {
-            ...qkDef,
-            ...(axes[axisId] ?? {}),
-            ...(initialized ? { min, max } : {}),
-            ...(qk ? { quantity_kind: qk } : {}),
-          }
-        }
+        if (this.axisRegistry.getScale(axisId)) axes[axisId] = this._axisConfig(axisId)
       }
     }
 
@@ -409,13 +551,26 @@ export class Plot extends GlBase {
 
     this._is3D = AXES.some(a => !AXES_2D.includes(a) && this.axisRegistry.getScale(a) !== null)
 
-    this._camera = new Camera(this._is3D)
-    this._camera.resize(this.plotWidth, this.plotHeight)
-
+    // Built before _layoutMargin() so the margin can size the tick-label and title
+    // bands from the rendered font (TickLabelAtlas.measure / .lineHeight).
     if (this._tickLabelAtlas) this._tickLabelAtlas.destroy()
     this._tickLabelAtlas = new TickLabelAtlas(this.regl)
 
+    this._layoutMargin()
+
+    // Carry the orbit orientation across update()/_initialize so an unrelated config change
+    // (e.g. an axis option from the menu) does not snap a 3D plot back to its default view.
+    const prevCamera = this._camera
+    this._camera = new Camera(this._is3D)
+    if (prevCamera?._is3D && this._is3D) {
+      this._camera._theta  = prevCamera._theta
+      this._camera._phi    = prevCamera._phi
+      this._camera._radius = prevCamera._radius
+    }
+    this._camera.resize(this.plotWidth, this.plotHeight)
+
     for (const entry of colorbars) {
+      if (entry.enabled === false) continue
       if (!entry.colorscale || entry.colorscale == "none") continue
       if (entry.xAxis) this.axisRegistry.ensureColorAxis(entry.xAxis, entry.colorscale)
       if (entry.yAxis) this.axisRegistry.ensureColorAxis(entry.yAxis, entry.colorscale)
@@ -423,6 +578,7 @@ export class Plot extends GlBase {
 
     if (!this._zoomController) this._zoomController = new ZoomController(this)
     if (!this._axisLimitEditor) this._axisLimitEditor = new AxisLimitEditor(this)
+    if (!this._axisMenu) this._axisMenu = new AxisMenu(this)
 
     for (const i of (this._interactions ?? [])) i.destroy()
     this._interactions = []
@@ -521,6 +677,35 @@ export class Plot extends GlBase {
     this.plotHeight = Math.max(1, h - this.margin.top  - this.margin.bottom)
     this._canvas.width  = w
     this._canvas.height = h
+  }
+
+  // Sets this.margin side by side: the constructor's `margin` where the side draws an
+  // axis, `marginWithoutAxis` where it draws none (no layer uses the axis, or it is
+  // hidden with `visible: false`). A 3D plot keeps `margin` on every side.
+  _layoutMargin() {
+    const sideAxis = { top: 'xaxis_top', right: 'yaxis_right', bottom: 'xaxis_bottom', left: 'yaxis_left' }
+    const axes = this.currentConfig.axes ?? {}
+    const drawsAxis = (axisId) => this.axisRegistry.getScale(axisId) !== null && axes[axisId]?.visible !== false
+    // When a side draws an axis, start from the full margin and give back the band of
+    // any hidden part (the title band when titleVisible:false, the tick-label band when
+    // tickLabelsVisible:false), never dropping below marginWithoutAxis for that side.
+    // The band sizes come from the rendered font via the atlas, not hard-coded.
+    const atlas = this._tickLabelAtlas
+    const sideMargin = (side, axisId) => {
+      if (this._is3D) return this._marginWithAxis[side]
+      const floor = this._marginWithoutAxis[side] ?? this._marginWithAxis[side]
+      if (!drawsAxis(axisId)) return floor
+      let m = this._marginWithAxis[side]
+      const c = axes[axisId] ?? {}
+      const axis = this._getAxis(axisId)
+      if (c.titleVisible === false)      m -= axis.titleBandPx(atlas)
+      if (c.tickLabelsVisible === false) m -= axis.tickLabelBandPx(atlas)
+      return Math.max(m, floor)
+    }
+    this.margin = Object.fromEntries(Object.entries(sideAxis).map(([side, axisId]) => [side, sideMargin(side, axisId)]))
+    this.plotWidth  = Math.max(1, this.width  - this.margin.left - this.margin.right)
+    this.plotHeight = Math.max(1, this.height - this.margin.top  - this.margin.bottom)
+    this.axisRegistry.resize(this.plotWidth, this.plotHeight)
   }
 
   // Phase 1 — async: refresh transforms and data columns.
@@ -781,6 +966,62 @@ export class Plot extends GlBase {
     }
   }
 
+  // ─── Range lock (local to this plot) ────────────────────────────────────────
+  //
+  // The lock is a per-slot `locked` key in axes.<slot>. It never propagates across
+  // linkAxes and never consults another plot. The only grouping it honours is within
+  // this plot: slots sharing a quantity kind are one axis to the user, so they share a
+  // lock. The stored truth is the `locked` key; these are derived read / config write.
+
+  // True when `slot` holds the lock, or when another slot of THIS plot with the same
+  // quantity kind holds it. Does not follow linked axes.
+  isAxisLocked(slot) {
+    const axes = this.currentConfig?.axes ?? {}
+    if (axes[slot]?.locked) return true
+    const qk = this.axisRegistry?.getQkForSlot(slot)
+    if (qk == null) return false
+    for (const other of AXES) {
+      if (other !== slot && axes[other]?.locked && this.axisRegistry.getQkForSlot(other) === qk) return true
+    }
+    return false
+  }
+
+  // Writes `locked` into axes.<slot> — set on the slot when turning on; cleared on the
+  // slot and every same-QK sibling of this plot when turning off — then renders again
+  // without update() (no layer rebuild). Touches only this plot's config.
+  setAxisLocked(slot, on) {
+    const config = this.currentConfig ?? {}
+    const axes = { ...(config.axes ?? {}) }
+    const clear = (s) => {
+      if (axes[s]?.locked) { const c = { ...axes[s] }; delete c.locked; axes[s] = c }
+    }
+    if (on) {
+      axes[slot] = { ...(axes[slot] ?? {}), locked: true }
+    } else {
+      const qk = this.axisRegistry?.getQkForSlot(slot)
+      clear(slot)
+      if (qk != null) {
+        for (const s of AXES) {
+          if (s !== slot && this.axisRegistry.getQkForSlot(s) === qk) clear(s)
+        }
+      }
+    }
+    this.currentConfig = { ...config, axes }
+    this.scheduleRender()
+    this._emitAxisOptions({ type: 'axisoptions', axis: slot, key: 'locked', value: !!on })
+  }
+
+  // Reset the 2D spatial axes to their data range. Color/filter axes and locked axes
+  // are left alone; a 3D plot does nothing (reset stays 2D-only).
+  resetAxes() {
+    if (this._is3D || !this.axisRegistry) return
+    for (const axisId of AXES_2D) {
+      if (!this.axisRegistry.getScale(axisId)) continue
+      if (this.isAxisLocked(axisId)) continue
+      this._getAxis(axisId).setDomain(null)
+    }
+  }
+
   _syncFloats() {
     const config = this.currentConfig ?? {}
     const axes = config.axes ?? {}
@@ -806,6 +1047,7 @@ export class Plot extends GlBase {
     }
 
     for (const entry of colorbarsConfig) {
+      if (entry.colorbar === false) continue
       const { xAxis, yAxis } = entry
       if (xAxis && yAxis) {
         const tag = `colorbar2d:${xAxis}:${yAxis}`
@@ -873,6 +1115,12 @@ export class Plot extends GlBase {
     this._axisLimitEditor?.destroy()
     this._axisLimitEditor = null
     this._axisLimitListeners.clear()
+
+    this._axisMenu?.destroy()
+    this._axisMenu = null
+    this._axisOptionsListeners.clear()
+    this._contextMenuListeners.clear()
+    this._contextMenuOpenListeners.clear()
 
     this._renderCallbacks.clear()
     this._canvas.remove()
@@ -1133,6 +1381,42 @@ export class Plot extends GlBase {
     }
   }
 
+  // Tell 'axisoptions' listeners that an axis-part key (visible / tickLabelsVisible /
+  // titleVisible / locked) was written — by the menu, a direct update({config}), or
+  // setAxisLocked(). Keyed by what changed, not who changed it, like _emitAxisLimit.
+  _emitAxisOptions(event) {
+    for (const cb of this._axisOptionsListeners) {
+      try { cb(event) } catch (e) { console.error('[gladly] Error in axisoptions listener:', e) }
+    }
+  }
+
+  // Fire the synthetic 'contextmenu' event for a right press+release gladly did not use,
+  // then open the built-in menu for the region (full or single-axis) when its gate is on.
+  // `region` is ZoomController._getRegion()'s { type, axes } for an axis strip or the plot
+  // area, or null for a corner / empty margin.
+  _emitContextMenu(e, region) {
+    const rect = this.container.getBoundingClientRect()
+    const coords = this.lookup(e.clientX - rect.left, e.clientY - rect.top)
+    for (const cb of this._contextMenuListeners) {
+      try { cb(e, coords, region) } catch (err) { console.error('[gladly] Error in contextmenu listener:', err) }
+    }
+    const onAxis = region?.type === 'axis'
+    const gated = onAxis ? (this.currentConfig?.axis_menu !== false) : (this.currentConfig?.plot_menu !== false)
+    // The menu is viewport-positioned (attached to document.body) so it escapes any float's
+    // clip and stacking context — pass the event's own viewport coordinates.
+    if (gated && this._axisMenu) this._axisMenu.open(e, coords, region)
+  }
+
+  // Fire every 'contextmenu_open' listener with the built-in menu's root element, just
+  // after it is built/refreshed and before it is placed (see AxisMenu.open). Mirrors
+  // 'contextmenu''s (e, coords, region) and appends the menu element; errors are isolated.
+  _emitContextMenuOpen(e, coords, region, menuEl) {
+    for (const cb of this._contextMenuOpenListeners) {
+      try { cb(e, coords, region, menuEl) }
+      catch (err) { console.error('[gladly] Error in contextmenu_open listener:', err) }
+    }
+  }
+
   scheduleRender(sourcePlot = null) {
     if (!this.regl) return
     this._dirty = true
@@ -1187,6 +1471,23 @@ export class Plot extends GlBase {
     if (eventType === 'axislimit') {
       this._axisLimitListeners.add(callback)
       return { remove: () => this._axisLimitListeners.delete(callback) }
+    }
+    if (eventType === 'axisoptions') {
+      this._axisOptionsListeners.add(callback)
+      return { remove: () => this._axisOptionsListeners.delete(callback) }
+    }
+    // 'contextmenu' is synthetic: a right press+release gladly did not use (see
+    // ZoomController / _emitContextMenu), not the raw DOM event. cb(e, coords, region).
+    if (eventType === 'contextmenu') {
+      this._contextMenuListeners.add(callback)
+      return { remove: () => this._contextMenuListeners.delete(callback) }
+    }
+    // 'contextmenu_open' is synthetic: fired from AxisMenu.open with the built-in menu's
+    // root element so a listener can augment it. cb(e, coords, region, menuEl); its first
+    // three args mirror 'contextmenu'.
+    if (eventType === 'contextmenu_open') {
+      this._contextMenuOpenListeners.add(callback)
+      return { remove: () => this._contextMenuOpenListeners.delete(callback) }
     }
     const handler = (e) => {
       if (!this.container.contains(e.target)) return
